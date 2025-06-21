@@ -7,7 +7,7 @@ export function rebuildMerkleHash(): {
   numMessages: number;
   trie: merkle.TrieNode;
 } {
-  const rows: { timestamp: string }[] = db.runQuery(
+  const rows: { timestamp: string }[] = db.runQuerySync(
     'SELECT timestamp FROM messages_crdt',
     [],
     true,

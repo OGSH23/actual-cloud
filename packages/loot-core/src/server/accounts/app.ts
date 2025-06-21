@@ -81,7 +81,7 @@ async function updateAccount({
 }
 
 async function getAccounts() {
-  return db.getAccounts();
+  return await db.getAccounts();
 }
 
 async function getAccountBalance({
@@ -416,20 +416,20 @@ async function closeAccount({
         // because another client could easily add new data that
         // should be marked as deleted.
 
-        rows.forEach(row => {
+        await Promise.all(rows.map(async row => {
           if (row.transfer_id) {
-            db.updateTransaction({
+            await db.updateTransaction({
               id: row.transfer_id,
               payee: null,
               transfer_id: null,
             });
           }
 
-          db.deleteTransaction({ id: row.id });
-        });
+          await db.deleteTransaction({ id: row.id });
+        }));
 
-        db.deleteAccount({ id });
-        db.deleteTransferPayee({ id: transferPayee.id });
+        await db.deleteAccount({ id });
+        await db.deleteTransferPayee({ id: transferPayee.id });
       });
     } else {
       if (balance !== 0 && transferAccountId == null) {

@@ -377,7 +377,7 @@ export function handleCategoryGroupChange(months, oldValue, newValue) {
         // OK because we're leveraging the sync nature of queries. Ideally we
         // wouldn't be querying here. But I think we have to. At least for now
         // we do
-        const categories = db.runQuery(
+        const categories = db.runQuerySync(
           'SELECT * FROM categories WHERE tombstone = 0 AND cat_group = ?',
           [group.id],
           true,

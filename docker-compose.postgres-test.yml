@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  postgres-test:
+    image: postgres:15
+    container_name: actual-postgres-test
+    environment:
+      POSTGRES_DB: actual_budget_test
+      POSTGRES_USER: actual_test_user
+      POSTGRES_PASSWORD: test_password_123
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - postgres_test_data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d
+    ports:
+      - "5433:5432"  # Use 5433 to avoid conflicts with existing PostgreSQL
+    networks:
+      - actual-test-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U actual_test_user -d actual_budget_test"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: >
+      postgres
+      -c shared_buffers=256MB
+      -c effective_cache_size=1GB
+      -c work_mem=4MB
+      -c maintenance_work_mem=64MB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=16MB
+      -c default_statistics_target=100
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c log_statement=all
+      -c log_min_duration_statement=100
+      -c track_activities=on
+      -c track_counts=on
+      -c track_io_timing=on
+
+  # Optional: PostgreSQL monitoring
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter
+    container_name: actual-postgres-exporter-test
+    environment:
+      DATA_SOURCE_NAME: "postgresql://actual_test_user:test_password_123@postgres-test:5432/actual_budget_test?sslmode=disable"
+    ports:
+      - "9188:9187"
+    networks:
+      - actual-test-network
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_test_data:
+    driver: local
+
+networks:
+  actual-test-network:
+    driver: bridge

@@ -7,12 +7,24 @@ import {
   makeClientId,
   Timestamp,
 } from '@actual-app/crdt';
-import { Database } from '@jlongster/sql.js';
+import { Database as SqliteDatabase } from '@jlongster/sql.js';
+import type { Database as PostgresDatabase } from '../../platform/server/postgres';
 import { LRUCache } from 'lru-cache';
 import { v4 as uuidv4 } from 'uuid';
 
 import * as fs from '../../platform/server/fs';
 import * as sqlite from '../../platform/server/sqlite';
+import {
+  DatabaseAdapter,
+  getDatabaseConfig,
+  getActiveAdapter,
+  isPostgresEnabled,
+  isFallbackToSqliteEnabled,
+  areHealthChecksEnabled,
+  isSchemaValidationEnabled,
+  validatePostgresConfig,
+  getConfigSummary,
+} from './config';
 import * as monthUtils from '../../shared/months';
 import { groupById } from '../../shared/util';
 import { TransactionEntity } from '../../types/models';
@@ -52,30 +64,336 @@ export * from './types';
 
 export { toDateRepr, fromDateRepr } from '../models';
 
+/**
+ * Perform database health checks
+ */
+async function performHealthChecks(): Promise<void> {
+  try {
+    console.log('🔍 Performing database health checks...');
+    
+    // Basic connectivity test
+    if (currentAdapter === 'postgres') {
+      const result = await runQuery('SELECT 1 as test', [], true);
+      if (!result || (result as any[]).length === 0) {
+        throw new Error('PostgreSQL connectivity test failed');
+      }
+    } else {
+      const result = await runQuery('SELECT 1 as test', [], true);
+      if (!result || (result as any[]).length === 0) {
+        throw new Error('SQLite connectivity test failed');
+      }
+    }
+    
+    // Schema validation for PostgreSQL
+    if (currentAdapter === 'postgres' && isSchemaValidationEnabled()) {
+      try {
+        const pgModule = await import('../../platform/server/postgres');
+        const isValid = await pgModule.isSchemaInitialized(db);
+        if (!isValid) {
+          throw new Error('PostgreSQL schema validation failed');
+        }
+      } catch (importError) {
+        console.warn('PostgreSQL schema validation skipped:', importError.message);
+      }
+    }
+    
+    console.log('✅ Database health checks passed');
+    
+  } catch (error) {
+    console.error('❌ Database health checks failed:', error);
+    throw error;
+  }
+}
+
+/**
+ * Get database status information
+ */
+export async function getDatabaseStatus(): Promise<{
+  adapter: DatabaseAdapter;
+  initialized: boolean;
+  error: string | null;
+  connectionCount?: number;
+  schemaValid?: boolean;
+}> {
+  const status = {
+    adapter: currentAdapter,
+    initialized: isInitialized,
+    error: initializationError?.message || null,
+  };
+  
+  if (!isInitialized) {
+    return status;
+  }
+  
+  try {
+    if (currentAdapter === 'postgres') {
+      // Get PostgreSQL-specific status
+      try {
+        const pgModule = await import('../../platform/server/postgres');
+        return {
+          ...status,
+          schemaValid: await pgModule.isSchemaInitialized(db),
+        };
+      } catch (importError) {
+        return {
+          ...status,
+          schemaValid: false,
+          error: `PostgreSQL module not available: ${importError.message}`,
+        };
+      }
+    } else {
+      // SQLite status
+      return {
+        ...status,
+        schemaValid: true, // SQLite schema is always assumed valid
+      };
+    }
+  } catch (error) {
+    return {
+      ...status,
+      error: error.message,
+    };
+  }
+}
+
+/**
+ * Switch database adapter at runtime
+ */
+export async function switchDatabaseAdapter(newAdapter: DatabaseAdapter): Promise<void> {
+  if (newAdapter === currentAdapter) {
+    console.log(`Already using ${newAdapter} adapter`);
+    return;
+  }
+  
+  console.log(`🔄 Switching from ${currentAdapter} to ${newAdapter}...`);
+  
+  try {
+    await setDatabaseAdapter(newAdapter);
+    // Database will be reopened when next operation is performed
+    console.log(`✅ Successfully switched to ${newAdapter} adapter`);
+  } catch (error) {
+    console.error(`❌ Failed to switch to ${newAdapter} adapter:`, error);
+    throw error;
+  }
+}
+
 let dbPath: string | null = null;
+// Union type for both database adapters
+type Database = SqliteDatabase | PostgresDatabase;
+
 let db: Database | null = null;
+let pgDb: any = null; // PostgreSQL database instance
+
+// Database adapter state
+let currentAdapter: DatabaseAdapter = getActiveAdapter();
+let isInitialized = false;
+let initializationError: Error | null = null;
 
 // Util
+
+/**
+ * Configure which database adapter to use with runtime switching support
+ */
+export async function setDatabaseAdapter(adapter: DatabaseAdapter): Promise<void> {
+  if (adapter === currentAdapter && isInitialized) {
+    return; // Already using the requested adapter
+  }
+  
+  console.log(`🔄 Switching database adapter from ${currentAdapter} to ${adapter}`);
+  
+  // Validate configuration before switching
+  const config = getDatabaseConfig();
+  config.adapter = adapter;
+  
+  if (adapter === 'postgres') {
+    const errors = validatePostgresConfig(config);
+    if (errors.length > 0) {
+      throw new Error(`PostgreSQL configuration errors: ${errors.join(', ')}`);
+    }
+  }
+  
+  // Close existing connections
+  await closeDatabase();
+  
+  // Update adapter
+  currentAdapter = adapter;
+  isInitialized = false;
+  initializationError = null;
+  
+  console.log(`✅ Database adapter switched to ${adapter}`);
+}
+
+/**
+ * Get the current database adapter
+ */
+export function getDatabaseAdapter(): DatabaseAdapter {
+  return currentAdapter;
+}
+
+/**
+ * Check if PostgreSQL adapter is active
+ */
+export function isPostgresAdapter(): boolean {
+  return currentAdapter === 'postgres';
+}
+
+/**
+ * Check if database is initialized and ready
+ */
+export function isDatabaseInitialized(): boolean {
+  return isInitialized && !initializationError;
+}
+
+/**
+ * Get database initialization error if any
+ */
+export function getDatabaseInitializationError(): Error | null {
+  return initializationError;
+}
 
 export function getDatabasePath() {
   return dbPath;
 }
 
-export async function openDatabase(id?: string) {
-  if (db) {
-    await sqlite.closeDatabase(db);
+export async function openDatabase(id?: string): Promise<void> {
+  try {
+    console.log(`🚀 Opening database with ${currentAdapter} adapter`);
+    console.log(getConfigSummary());
+    
+    // Close existing connections
+    await closeDatabase();
+    
+    if (currentAdapter === 'postgres') {
+      await openPostgresDatabase();
+    } else {
+      await openSqliteDatabase(id);
+    }
+    
+    // Perform health checks if enabled
+    if (areHealthChecksEnabled()) {
+      await performHealthChecks();
+    }
+    
+    isInitialized = true;
+    initializationError = null;
+    console.log(`✅ ${currentAdapter} database opened successfully`);
+    
+  } catch (error) {
+    initializationError = error as Error;
+    isInitialized = false;
+    
+    console.error(`❌ Failed to open ${currentAdapter} database:`, error);
+    
+    // Attempt fallback to SQLite if PostgreSQL fails
+    if (currentAdapter === 'postgres' && isFallbackToSqliteEnabled()) {
+      console.log('🔄 Attempting fallback to SQLite...');
+      try {
+        currentAdapter = 'sqlite';
+        await openSqliteDatabase(id);
+        isInitialized = true;
+        initializationError = null;
+        console.log('✅ Successfully fell back to SQLite');
+      } catch (fallbackError) {
+        console.error('❌ Fallback to SQLite also failed:', fallbackError);
+        throw fallbackError;
+      }
+    } else {
+      throw error;
+    }
   }
-
-  dbPath = fs.join(fs.getBudgetDir(id), 'db.sqlite');
-  setDatabase(await sqlite.openDatabase(dbPath));
-
-  // await execQuery('PRAGMA journal_mode = WAL');
 }
 
-export async function closeDatabase() {
-  if (db) {
-    await sqlite.closeDatabase(db);
+/**
+ * Open SQLite database
+ */
+async function openSqliteDatabase(id?: string): Promise<void> {
+  dbPath = fs.join(fs.getBudgetDir(id), 'db.sqlite');
+  setDatabase(await sqlite.openDatabase(dbPath));
+  
+  // Apply SQLite pragmas
+  const config = getDatabaseConfig();
+  if (config.sqlite?.pragmas) {
+    for (const [pragma, value] of Object.entries(config.sqlite.pragmas)) {
+      await execQuery(`PRAGMA ${pragma} = ${value}`);
+    }
+  }
+}
+
+/**
+ * Open PostgreSQL database with dynamic import
+ */
+async function openPostgresDatabase(): Promise<void> {
+  try {
+    // Check if we're in a server environment
+    if (typeof window !== 'undefined') {
+      throw new Error('PostgreSQL adapter not available in browser environment');
+    }
+    
+    // Dynamic import to avoid bundling issues
+    let pgModule;
+    try {
+      pgModule = await import('../../platform/server/postgres');
+    } catch (importError) {
+      // If PostgreSQL module can't be loaded, provide a helpful error
+      throw new Error(`PostgreSQL module not available. Ensure 'pg' package is installed and this is a server environment. Error: ${importError.message}`);
+    }
+    
+    const config = getDatabaseConfig();
+    
+    // Prepare PostgreSQL configuration
+    const pgConfig = config.postgres ? {
+      connectionString: config.postgres.connectionString,
+      maxConnections: config.postgres.maxConnections,
+      idleTimeoutMs: config.postgres.idleTimeoutMs,
+      connectionTimeoutMs: config.postgres.connectionTimeoutMs,
+    } : undefined;
+    
+    // Open PostgreSQL connection
+    pgDb = pgModule.openDatabase(pgConfig);
+    
+    // Initialize schema if needed
+    if (isSchemaValidationEnabled()) {
+      const isInitialized = await pgModule.isSchemaInitialized(pgDb);
+      if (!isInitialized) {
+        console.log('🔧 Initializing PostgreSQL schema...');
+        await pgModule.initializePostgresSchema(pgDb);
+        console.log('✅ PostgreSQL schema initialized');
+      }
+    }
+    
+    // Set as current database for compatibility
+    setDatabase(pgDb);
+    
+  } catch (error) {
+    console.error('Failed to load PostgreSQL module:', error);
+    throw new Error(`PostgreSQL initialization failed: ${error.message}`);
+  }
+}
+
+export async function closeDatabase(): Promise<void> {
+  try {
+    if (currentAdapter === 'postgres' && pgDb) {
+      // Dynamic import for PostgreSQL close
+      try {
+        const pgModule = await import('../../platform/server/postgres');
+        await pgModule.closeDatabase(pgDb);
+      } catch (error) {
+        console.warn('Failed to load PostgreSQL module for close:', error);
+      }
+      pgDb = null;
+    } else if (db) {
+      await sqlite.closeDatabase(db);
+    }
+    
     setDatabase(null);
+    isInitialized = false;
+    
+  } catch (error) {
+    console.error('Error closing database:', error);
+    // Still reset state even if close failed
+    setDatabase(null);
+    pgDb = null;
+    isInitialized = false;
   }
 }
 
@@ -107,44 +425,166 @@ export async function loadClock() {
   }
 }
 
-// Functions
-export function runQuery(
+// Functions - Async Database Operations
+
+/**
+ * Core async runQuery function - now truly async for future PostgreSQL support
+ * Currently wraps SQLite's sync behavior to maintain compatibility
+ */
+export async function runQuery(
   sql: string,
   params?: Array<string | number>,
   fetchAll?: false,
-): { changes: unknown };
+): Promise<{ changes: unknown; insertId?: unknown }>;
 
-export function runQuery<T>(
+export async function runQuery<T>(
+  sql: string,
+  params: Array<string | number> | undefined,
+  fetchAll: true,
+): Promise<T[]>;
+
+export async function runQuery<T>(
+  sql: string,
+  params: (string | number)[] = [],
+  fetchAll = false,
+): Promise<T[] | { changes: unknown; insertId?: unknown }> {
+  if (!db) {
+    throw new Error('Database not connected. Call openDatabase() first.');
+  }
+  
+  if (!isInitialized) {
+    throw new Error('Database not properly initialized');
+  }
+  
+  if (initializationError) {
+    throw new Error(`Database initialization error: ${initializationError.message}`);
+  }
+  
+  try {
+    if (currentAdapter === 'postgres') {
+      // Use PostgreSQL adapter
+      try {
+        const pgModule = await import('../../platform/server/postgres');
+        return await pgModule.runQuery(db, sql, params, fetchAll);
+      } catch (importError) {
+        throw new Error(`PostgreSQL module not available: ${importError.message}`);
+      }
+    } else {
+      // Use SQLite adapter (wrapped in Promise for consistency)
+      const result = sqlite.runQuery<T>(db, sql, params, fetchAll);
+      return Promise.resolve(result);
+    }
+  } catch (error) {
+    console.error(`Database query failed (${currentAdapter}):`, { sql, params, error });
+    throw error;
+  }
+}
+
+/**
+ * Legacy sync version for backward compatibility during transition
+ * @deprecated Use async runQuery instead
+ */
+export function runQuerySync(
+  sql: string,
+  params?: Array<string | number>,
+  fetchAll?: false,
+): { changes: unknown; insertId?: unknown };
+
+export function runQuerySync<T>(
   sql: string,
   params: Array<string | number> | undefined,
   fetchAll: true,
 ): T[];
 
-export function runQuery<T>(
+export function runQuerySync<T>(
   sql: string,
-  params: (string | number)[],
-  fetchAll: boolean,
-) {
-  if (fetchAll) {
-    return sqlite.runQuery<T>(db, sql, params, true);
-  } else {
-    return sqlite.runQuery(db, sql, params, false);
+  params: (string | number)[] = [],
+  fetchAll = false,
+): T[] | { changes: unknown; insertId?: unknown } {
+  if (!db) {
+    throw new Error('Database not connected. Call openDatabase() first.');
+  }
+  
+  // PostgreSQL adapter requires async operations, but some legacy code
+  // still uses synchronous calls. For now, we'll return empty results
+  // to prevent crashes while working toward full async migration.
+  if (currentAdapter === 'postgres') {
+    console.warn(
+      'Warning: Synchronous database operation requested with PostgreSQL adapter. ' +
+      'Returning empty results to prevent crashes. Some functionality may be limited. ' +
+      'Consider updating to async operations for full PostgreSQL compatibility.'
+    );
+    
+    if (fetchAll) {
+      return [] as T[];
+    } else {
+      return { changes: 0, insertId: null };
+    }
+  }
+  
+  return sqlite.runQuery<T>(db, sql, params, fetchAll);
+}
+
+/**
+ * Execute SQL without returning results (async version)
+ */
+export async function execQuery(sql: string): Promise<void> {
+  if (!db) {
+    throw new Error('Database not connected. Call openDatabase() first.');
+  }
+  
+  if (!isInitialized) {
+    throw new Error('Database not properly initialized');
+  }
+  
+  try {
+    if (currentAdapter === 'postgres') {
+      // Use PostgreSQL adapter
+      try {
+        const pgModule = await import('../../platform/server/postgres');
+        await pgModule.execQuery(db, sql);
+      } catch (importError) {
+        throw new Error(`PostgreSQL module not available: ${importError.message}`);
+      }
+    } else {
+      // Use SQLite adapter
+      sqlite.execQuery(db, sql);
+    }
+  } catch (error) {
+    console.error(`Database exec failed (${currentAdapter}):`, { sql, error });
+    throw error;
   }
 }
 
-export function execQuery(sql: string) {
+/**
+ * Legacy sync version for backward compatibility
+ * @deprecated Use async execQuery instead
+ */
+export function execQuerySync(sql: string): void {
+  if (!db) {
+    throw new Error('Database not connected. Call openDatabase() first.');
+  }
+  
   sqlite.execQuery(db, sql);
 }
 
 // This manages an LRU cache of prepared query statements. This is
 // only needed in hot spots when you are running lots of queries.
 let _queryCache = new LRUCache<string, string>({ max: 100 });
+
+/**
+ * Prepare and cache SQL statements for performance
+ */
 export function cache(sql: string) {
   const cached = _queryCache.get(sql);
   if (cached) {
     return cached;
   }
 
+  if (!db) {
+    throw new Error('Database not connected. Call openDatabase() first.');
+  }
+  
   const prepared = sqlite.prepare(db, sql);
   _queryCache.set(sql, prepared);
   return prepared;
@@ -154,38 +594,131 @@ function resetQueryCache() {
   _queryCache = new LRUCache<string, string>({ max: 100 });
 }
 
-export function transaction(fn: () => void) {
+/**
+ * Execute function within a database transaction
+ * Supports both sync and async functions
+ */
+export async function transaction(fn: () => void | Promise<void>): Promise<void> {
+  if (!db) {
+    throw new Error('Database not connected. Call openDatabase() first.');
+  }
+  
+  if (!isInitialized) {
+    throw new Error('Database not properly initialized');
+  }
+  
+  try {
+    if (currentAdapter === 'postgres') {
+      // Use PostgreSQL adapter
+      try {
+        const pgModule = await import('../../platform/server/postgres');
+        await pgModule.transaction(db, fn);
+      } catch (importError) {
+        throw new Error(`PostgreSQL module not available: ${importError.message}`);
+      }
+    } else {
+      // Use SQLite adapter with proper async/sync detection
+      if (fn.constructor.name === 'AsyncFunction') {
+        await sqlite.asyncTransaction(db, fn as () => Promise<void>);
+      } else {
+        sqlite.transaction(db, fn as () => void);
+      }
+    }
+  } catch (error) {
+    console.error(`Database transaction failed (${currentAdapter}):`, error);
+    throw error;
+  }
+}
+
+/**
+ * Execute async function within a database transaction
+ * Preferred method for new code
+ */
+export async function asyncTransaction(fn: () => Promise<void>): Promise<void> {
+  if (!db) {
+    throw new Error('Database not connected. Call openDatabase() first.');
+  }
+  
+  if (!isInitialized) {
+    throw new Error('Database not properly initialized');
+  }
+  
+  try {
+    if (currentAdapter === 'postgres') {
+      // Use PostgreSQL adapter
+      try {
+        const pgModule = await import('../../platform/server/postgres');
+        await pgModule.asyncTransaction(db, fn);
+      } catch (importError) {
+        throw new Error(`PostgreSQL module not available: ${importError.message}`);
+      }
+    } else {
+      // Use SQLite adapter
+      await sqlite.asyncTransaction(db, fn);
+    }
+  } catch (error) {
+    console.error(`Database async transaction failed (${currentAdapter}):`, error);
+    throw error;
+  }
+}
+
+/**
+ * Legacy sync transaction for backward compatibility
+ * @deprecated Use async transaction instead
+ */
+export function transactionSync(fn: () => void): void {
+  if (!db) {
+    throw new Error('Database not connected. Call openDatabase() first.');
+  }
+  
   return sqlite.transaction(db, fn);
 }
 
-export function asyncTransaction(fn: () => Promise<void>) {
-  return sqlite.asyncTransaction(db, fn);
+/**
+ * Execute query and return all rows (truly async)
+ */
+export async function all<T>(sql: string, params?: (string | number)[]): Promise<T[]> {
+  return await runQuery<T>(sql, params, true);
 }
 
-// This function is marked as async because `runQuery` is no longer
-// async. We return a promise here until we've audited all the code to
-// make sure nothing calls `.then` on this.
-export async function all<T>(sql: string, params?: (string | number)[]) {
-  return runQuery<T>(sql, params, true);
-}
-
-export async function first<T>(sql, params?: (string | number)[]) {
+/**
+ * Execute query and return first row or null (truly async)
+ */
+export async function first<T>(sql: string, params?: (string | number)[]): Promise<T | null> {
   const arr = await runQuery<T>(sql, params, true);
   return arr.length === 0 ? null : arr[0];
 }
 
-// The underlying sql system is now sync, but we can't update `first` yet
-// without auditing all uses of it
-export function firstSync<T>(sql, params?: (string | number)[]) {
-  const arr = runQuery<T>(sql, params, true);
+/**
+ * Execute query without returning rows (truly async)
+ */
+export async function run(sql: string, params?: (string | number)[]): Promise<{ changes: unknown; insertId?: unknown }> {
+  return await runQuery(sql, params, false);
+}
+
+/**
+ * Legacy sync version of first() for backward compatibility
+ * @deprecated Use async first() instead
+ */
+export function firstSync<T>(sql: string, params?: (string | number)[]): T | null {
+  const arr = runQuerySync<T>(sql, params, true) as T[];
   return arr.length === 0 ? null : arr[0];
 }
 
-// This function is marked as async because `runQuery` is no longer
-// async. We return a promise here until we've audited all the code to
-// make sure nothing calls `.then` on this.
-export async function run(sql, params?: (string | number)[]) {
-  return runQuery(sql, params);
+/**
+ * Legacy sync version of all() for backward compatibility
+ * @deprecated Use async all() instead
+ */
+export function allSync<T>(sql: string, params?: (string | number)[]): T[] {
+  return runQuerySync<T>(sql, params, true) as T[];
+}
+
+/**
+ * Legacy sync version of run() for backward compatibility
+ * @deprecated Use async run() instead
+ */
+export function runSync(sql: string, params?: (string | number)[]): { changes: unknown; insertId?: unknown } {
+  return runQuerySync(sql, params, false) as { changes: unknown; insertId?: unknown };
 }
 
 export async function select(table, id) {

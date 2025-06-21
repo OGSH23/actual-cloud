@@ -55,6 +55,7 @@
   "devDependencies": {
     "@octokit/rest": "^22.0.0",
     "@types/node": "^22.15.18",
+    "@types/pg": "^8",
     "@types/prompts": "^2.4.9",
     "@typescript-eslint/parser": "^8.32.1",
     "cross-env": "^7.0.3",
@@ -100,5 +101,8 @@
   "browserslist": [
     "electron 24.0",
     "defaults"
-  ]
+  ],
+  "dependencies": {
+    "pg": "^8.16.1"
+  }
 }

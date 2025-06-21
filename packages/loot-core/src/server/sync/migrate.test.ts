@@ -79,7 +79,7 @@ describe('sync migrations', () => {
     tracer.expectNow('applied', ['trans1/child1']);
     await tracer.expectWait('applied', ['trans1/child1']);
 
-    const transactions = db.runQuery<db.DbTransaction>(
+    const transactions = db.runQuerySync<db.DbTransaction>(
       'SELECT * FROM transactions',
       [],
       true,

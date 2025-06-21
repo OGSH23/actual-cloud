@@ -43,7 +43,7 @@ export function createCategory(cat, sheetName, prevSheetName, start, end) {
     initialValue: 0,
     run: () => {
       // Making this sync is faster!
-      const rows = db.runQuery<{ amount: number }>(
+      const rows = db.runQuerySync<{ amount: number }>(
         `SELECT SUM(amount) as amount FROM v_transactions_internal_alive t
            LEFT JOIN accounts a ON a.id = t.account
          WHERE t.date >= ${start} AND t.date <= ${end}
@@ -66,7 +66,7 @@ export function createCategory(cat, sheetName, prevSheetName, start, end) {
 
 function handleAccountChange(months, oldValue, newValue) {
   if (!oldValue || oldValue.offbudget !== newValue.offbudget) {
-    const rows = db.runQuery<Pick<db.DbTransaction, 'category'>>(
+    const rows = db.runQuerySync<Pick<db.DbTransaction, 'category'>>(
       `
         SELECT DISTINCT(category) as category FROM transactions
         WHERE acct = ?

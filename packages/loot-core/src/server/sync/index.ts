@@ -73,7 +73,7 @@ export function checkSyncingMode(mode: SyncingMode): boolean {
   }
 }
 
-function apply(msg: Message, prev?: boolean) {
+async function apply(msg: Message, prev?: boolean) {
   const { dataset, row, column, value } = msg;
 
   if (dataset === 'prefs') {
@@ -93,7 +93,7 @@ function apply(msg: Message, prev?: boolean) {
         };
       }
 
-      db.runQuery(db.cache(query.sql), query.params);
+      await db.runQuery(db.cache(query.sql), query.params);
     } catch (error) {
       throw new SyncError('invalid-schema', {
         error: { message: error.message, stack: error.stack },
@@ -198,7 +198,7 @@ async function compareMessages(messages: Message[]): Promise<Message[]> {
     const { dataset, row, column, timestamp } = message;
     const timestampStr = timestamp.toString();
 
-    const res = db.runQuery<Pick<db.DbCrdtMessage, 'timestamp'>>(
+    const res = await db.runQuery<Pick<db.DbCrdtMessage, 'timestamp'>>(
       db.cache(
         'SELECT timestamp FROM messages_crdt WHERE dataset = ? AND row = ? AND column = ? AND timestamp >= ?',
       ),
@@ -224,17 +224,17 @@ async function compareMessages(messages: Message[]): Promise<Message[]> {
 // listeners importers should not rely on any functions that use any
 // projected state (like rules). We can't fire those because they
 // depend on having both old and new data which we don't quere here
-function applyMessagesForImport(messages: Message[]): void {
-  db.transaction(() => {
+async function applyMessagesForImport(messages: Message[]): Promise<void> {
+  await db.transaction(async () => {
     for (let i = 0; i < messages.length; i++) {
       const msg = messages[i];
       const { dataset } = msg;
 
       if (!msg.old) {
         try {
-          apply(msg);
+          await apply(msg);
         } catch (e) {
-          apply(msg, true);
+          await apply(msg, true);
         }
 
         if (dataset === 'prefs') {
@@ -256,7 +256,7 @@ export type Message = {
 
 export const applyMessages = sequential(async (messages: Message[]) => {
   if (checkSyncingMode('import')) {
-    applyMessagesForImport(messages);
+    await applyMessagesForImport(messages);
     return undefined;
   } else if (checkSyncingMode('enabled')) {
     // Compare the messages with the existing crdt. This filters out
@@ -331,14 +331,14 @@ export const applyMessages = sequential(async (messages: Message[]) => {
   // nothing is changed. This is critical to maintain consistency. We
   // also avoid any side effects to in-memory objects, and apply them
   // after this succeeds.
-  db.transaction(() => {
+  await db.transaction(async () => {
     const added = new Set();
 
     for (const msg of messages) {
       const { dataset, row, column, timestamp, value } = msg;
 
       if (!msg.old) {
-        apply(msg, getIn(oldData, [dataset, row]) || added.has(dataset + row));
+        await apply(msg, getIn(oldData, [dataset, row]) || added.has(dataset + row));
 
         if (dataset === 'prefs') {
           prefsToSet[row] = value;
@@ -351,7 +351,7 @@ export const applyMessages = sequential(async (messages: Message[]) => {
       }
 
       if (checkSyncingMode('enabled')) {
-        db.runQuery(
+        await db.runQuery(
           db.cache(`INSERT INTO messages_crdt (timestamp, dataset, row, column, value)
            VALUES (?, ?, ?, ?, ?)`),
           [timestamp.toString(), dataset, row, column, serializeValue(value)],
@@ -371,7 +371,7 @@ export const applyMessages = sequential(async (messages: Message[]) => {
 
       // Save the clock in the db first (queries might throw
       // exceptions)
-      db.runQuery(
+      await db.runQuery(
         db.cache(
           'INSERT OR REPLACE INTO messages_clock (id, clock) VALUES (1, ?)',
         ),
@@ -487,8 +487,8 @@ export async function sendMessages(messages: Message[]) {
   }
 }
 
-export function getMessagesSince(since: string): Message[] {
-  return db.runQuery(
+export async function getMessagesSince(since: string): Promise<Message[]> {
+  return await db.runQuery(
     'SELECT timestamp, dataset, row, column, value FROM messages_crdt WHERE timestamp > ?',
     [since],
     true,
@@ -642,7 +642,7 @@ async function _fullSync(
     // Default to 5 minutes ago
     new Timestamp(Date.now() - 5 * 60 * 1000, 0, '0').toString();
 
-  const messages = getMessagesSince(since);
+  const messages = await getMessagesSince(since);
 
   const userToken = await asyncStorage.getItem('user-token');
 
